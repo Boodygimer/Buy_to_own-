@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phase 1 checks</title>
+  <style>
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 16px; background: #0b0b10; color: #e8e8f0; }
+    button { font: inherit; padding: 10px 14px; margin: 0 8px 8px 0; border-radius: 8px; border: 1px solid #444; background: #1c1c28; color: inherit; }
+    pre { white-space: pre-wrap; word-break: break-word; background: #12121a; padding: 12px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h3>Phase 1: crypto + db checks</h3>
+  <button id="run">Run all checks</button>
+  <button id="reset">Reset database</button>
+  <pre id="out">Press "Run all checks".</pre>
+
+  <script src="../src/crypto.js"></script>
+  <script src="../src/db.js"></script>
+  <script>
+    (function () {
+      var out = document.getElementById('out');
+      function show(value) {
+        out.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+      }
+      document.getElementById('run').onclick = async function () {
+        show('Running...');
+        try {
+          var cryptoResult = await Vault.crypto.selfTest();
+          var init = await Vault.db.init();
+          var dbVerify = await Vault.db.verify();
+          var dbResult = await Vault.db.selfTest();
+          show({
+            ALL_OK: cryptoResult.ok && dbVerify.ok && dbResult.ok,
+            crypto: cryptoResult,
+            init: { seeded: init.seeded, persisted: init.persisted, user: init.user && init.user.username },
+            dbVerify: dbVerify,
+            dbIntegration: dbResult
+          });
+        } catch (e) {
+          show('FAILED: ' + ((e && e.stack) || e));
+        }
+      };
+      document.getElementById('reset').onclick = async function () {
+        try {
+          await Vault.db.reset();
+          show('Database deleted. Press "Run all checks" to re-seed.');
+        } catch (e) {
+          show('FAILED: ' + ((e && e.stack) || e));
+        }
+      };
+    })();
+  </script>
+</body>
+</html>

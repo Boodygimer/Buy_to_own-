@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phase 2 checks</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 16px; background: #0b0b10; color: #e8e8f0; }
+    h3, h4 { margin: 18px 0 8px; }
+    button, select, input { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid #444; background: #1c1c28; color: inherit; }
+    button { margin: 0 6px 8px 0; }
+    button.primary { background: #4c3bd1; border-color: #6a5cf0; }
+    button.warn { border-color: #a4552c; }
+    input { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+    select { width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+    .card { background: #12121a; border: 1px solid #262636; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+    .row { padding: 6px 0; border-bottom: 1px solid #1f1f2c; word-break: break-word; }
+    .row:last-child { border-bottom: 0; }
+    .pass { color: #5fdc8c; } .fail { color: #ff6b6b; } .skip { color: #e0b84e; }
+    .note { color: #9a9ab0; font-size: 12px; }
+    pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 12px; max-height: 220px; overflow: auto; }
+    audio { width: 100%; margin-top: 8px; }
+    .codes button { font-size: 12px; padding: 6px 8px; }
+    #summary { font-weight: 600; margin: 8px 0; }
+  </style>
+</head>
+<body>
+  <h3>Phase 2: ownership + media checks</h3>
+
+  <div class="card">
+    <button id="runSuite" class="primary">Run full suite (resets DB)</button>
+    <div id="summary" class="note">Not run yet. The suite deletes and re-seeds the local database.</div>
+    <div id="results"></div>
+  </div>
+
+  <h3>Playground (uses current data, no reset)</h3>
+  <div class="card">
+    <div id="who" class="note"></div>
+    <select id="product"></select>
+    <div id="state" class="note" style="margin-bottom:8px"></div>
+    <button id="buy">Buy</button>
+    <button id="cache">Cache to vault</button>
+    <button id="play" class="primary">Play</button>
+    <button id="revoke" class="warn">Revoke license</button>
+    <button id="evict" class="warn">Evict from vault</button>
+    <audio id="player" controls></audio>
+
+    <h4>Redeem a code</h4>
+    <input id="code" placeholder="XXXX-XXXX-XXXX" autocapitalize="characters" autocomplete="off">
+    <button id="redeem">Redeem</button>
+    <div id="codeButtons" class="codes"></div>
+
+    <h4>Log</h4>
+    <pre id="log"></pre>
+  </div>
+
+  <script src="../src/crypto.js"></script>
+  <script src="../src/db.js"></script>
+  <script src="../src/services/ownership.js"></script>
+  <script src="../src/services/media.js"></script>
+
+  <!-- ============================ AUTOMATED SUITE ============================ -->
+  <script id="suite">
+    async function runPhase2Suite(onResult) {
+      var V = Vault;
+      var results = [];
+      var hasDom = typeof document !== 'undefined' && typeof Audio !== 'undefined';
+
+      async function test(name, fn) {
+        var t0 = Date.now();
+        var row;
+        try {
+          var note = await fn();
+          row = { test: name, status: 'pass', ms: Date.now() - t0, note: note || '' };
+        } catch (e) {
+          row = { test: name, status: e && e.skip ? 'skip' : 'fail', ms: Date.now() - t0, note: String((e && e.message) || e) };
+        }
+        results.push(row);
+        if (onResult) onResult(row);
+      }
+      function assert(cond, msg) { if (!cond) throw new Error(msg); }
+      function skip(msg) { var e = new Error(msg); e.skip = true; throw e; }
+      async function rejects(fn, code) {
+        var err = null;
+        try { await fn(); } catch (e) { err = e; }
+        assert(err, 'expected ' + code + ' but the call succeeded');
+        assert(err.code === code, 'expected ' + code + ' but got ' + (err.code || err.message));
+        return err;
+      }
+      async function sha(bytes) { return V.crypto.sha256Hex(bytes); }
+      function waitAudio(url, expected) {
+        return new Promise(function (resolve, reject) {
+          var a = new Audio();
+          var timer = setTimeout(function () { reject(new Error('audio element timed out')); }, 10000);
+          a.preload = 'metadata';
+          a.onloadedmetadata = function () {
+            clearTimeout(timer);
+            if (Math.abs(a.duration - expected) > 1.5) reject(new Error('audio duration ' + a.duration + ' vs expected ' + expected));
+            else resolve(a.duration);
+          };
+          a.onerror = function () { clearTimeout(timer); reject(new Error('audio element could not decode the blob')); };
+          a.src = url;
+        });
+      }
+
+      var P1 = 'prod_neon_horizon';      // buy -> cache -> play -> revoke -> re-buy
+      var P2 = 'prod_midnight_loop';     // concurrent double purchase
+      var P3 = 'prod_coastal_drift';     // redeem -> cache -> tamper -> repair
+      var P4 = 'prod_ember_pulse';       // events + license tampering
+      var P5 = 'prod_paper_moons';       // relabelled vault entry
+      var CODE = {};
+      V.db.TEST_ACTIVATION_CODES.forEach(function (c) { CODE[c.product_id] = c.code; });
+
+      var user, catalog, licP1, wavP1, wavP3, hashP1, hashP3;
+
+      await test('Reset + init database, default user, 6 products', async function () {
+        await V.db.reset();
+        await V.db.init();
+        user = await V.db.getCurrentUser();
+        catalog = await V.ownership.getCatalog();
+        assert(user && user.id, 'no default user');
+        assert(catalog.length === 6, 'catalog size ' + catalog.length);
+      });
+
+      await test('synth:// parser accepts catalog URLs and rejects bad ones', async function () {
+        var p = V.media.parseSynthUrl(catalog.find(function (c) { return c.id === P1; }).media_source_url);
+        assert(p.scale === 'minor' && p.bpm === 100 && p.bars === 12, 'wrong params ' + JSON.stringify(p));
+        var bad = ['http://x/y.mp3', 'synth://a?root=220', 'synth://a?root=9999&scale=minor&bpm=100&bars=8&wave=sine&seed=1',
+                   'synth://a?root=220&scale=locrian&bpm=100&bars=8&wave=sine&seed=1',
+                   'synth://a?root=220&scale=minor&bpm=100&bars=8&wave=noise&seed=1'];
+        bad.forEach(function (u) {
+          var threw = false;
+          try { V.media.parseSynthUrl(u); } catch (e) { threw = e.code === 'BAD_SOURCE'; }
+          assert(threw, 'accepted: ' + u);
+        });
+      });
+
+      await test('Synth renders valid, audible 22.05 kHz mono WAV of the advertised length', async function () {
+        var prod = catalog.find(function (c) { return c.id === P1; });
+        wavP1 = await V.media.synthesize(prod.media_source_url);
+        var info = V.media.inspectWav(wavP1.bytes);
+        assert(info.ok, 'invalid WAV: ' + info.error);
+        assert(info.sampleRate === 22050 && info.channels === 1 && info.bitsPerSample === 16, 'format');
+        assert(Math.abs(info.durationSec - prod.duration_sec) <= 1, 'duration ' + info.durationSec + ' vs ' + prod.duration_sec);
+        assert(info.peak > 0.5 && info.peak <= 1, 'peak ' + info.peak);
+        assert(info.rms > 0.03, 'too quiet: rms ' + info.rms);
+        hashP1 = await sha(wavP1.bytes);
+        return info.durationSec.toFixed(1) + 's, peak ' + info.peak.toFixed(2) + ', rms ' + info.rms.toFixed(3) + ', ' + Math.round(wavP1.bytes.length / 1024) + ' KB';
+      });
+
+      await test('Synth is deterministic and each track is different', async function () {
+        var again = await V.media.synthesize(catalog.find(function (c) { return c.id === P1; }).media_source_url);
+        assert((await sha(again.bytes)) === hashP1, 'same URL produced different audio');
+        var other = await V.media.synthesize(catalog.find(function (c) { return c.id === P3; }).media_source_url);
+        wavP3 = other;
+        hashP3 = await sha(other.bytes);
+        assert(hashP3 !== hashP1, 'two tracks are identical');
+      });
+
+      await test('Before purchase: cache and playback are denied, vault stays empty', async function () {
+        await rejects(function () { return V.media.cacheProduct({ userId: user.id, productId: P1 }); }, 'NOT_LICENSED');
+        await rejects(function () { return V.media.openForPlayback({ userId: user.id, productId: P1 }); }, 'NOT_LICENSED');
+        assert(!(await V.media.isCached(P1)), 'vault should be empty');
+        var a = await V.media.getAvailability({ userId: user.id, productId: P1 });
+        assert(a.state === 'not_owned', 'state ' + a.state);
+      });
+
+      await test('Purchase writes purchase + license together and binds them', async function () {
+        var r = await V.ownership.purchase({ userId: user.id, productId: P1 });
+        licP1 = r.license;
+        assert(r.purchase.product_id === P1 && r.purchase.user_id === user.id, 'purchase fields');
+        assert(/^TXN-/.test(r.purchase.transaction_ref), 'txn ref ' + r.purchase.transaction_ref);
+        assert(r.purchase.amount === r.product.price && r.purchase.amount > 0, 'amount');
+        assert(r.license.status === 'active' && r.license.purchase_id === r.purchase.id, 'license link');
+        assert(/^LIC(-[A-Z0-9]{4}){4}$/.test(r.license.license_key), 'license key format');
+        var v = await V.ownership.verifyLicense({ userId: user.id, productId: P1 });
+        assert(v.licensed && v.reason === 'ok', 'verify: ' + v.reason);
+        return r.purchase.transaction_ref + ' / ' + r.license.license_key;
+      });
+
+      await test('Purchase does NOT make media available (owned, not cached)', async function () {
+        var a = await V.media.getAvailability({ userId: user.id, productId: P1 });
+        assert(a.state === 'owned_not_cached', 'state ' + a.state);
+        await rejects(function () { return V.media.openForPlayback({ userId: user.id, productId: P1 }); }, 'NOT_CACHED');
+      });
+
+      await test('Buying an owned item again is rejected without a second purchase', async function () {
+        await rejects(function () { return V.ownership.purchase({ userId: user.id, productId: P1 }); }, 'ALREADY_OWNED');
+        var list = await V.db.getAllFromIndex('purchases', 'product_id', P1);
+        assert(list.length === 1, 'purchase rows: ' + list.length);
+      });
+
+      await test('Concurrent double purchase: exactly one wins', async function () {
+        var settled = await Promise.allSettled([
+          V.ownership.purchase({ userId: user.id, productId: P2 }),
+          V.ownership.purchase({ userId: user.id, productId: P2 })
+        ]);
+        var ok = settled.filter(function (s) { return s.status === 'fulfilled'; }).length;
+        var dup = settled.filter(function (s) { return s.status === 'rejected' && s.reason.code === 'ALREADY_OWNED'; }).length;
+        assert(ok === 1 && dup === 1, 'fulfilled ' + ok + ', ALREADY_OWNED ' + dup);
+        assert((await V.db.getAllFromIndex('purchases', 'product_id', P2)).length === 1, 'duplicate purchase rows');
+        assert((await V.db.getAllFromIndex('ownership_licenses', 'product_id', P2)).length === 1, 'duplicate license rows');
+      });
+
+      await test('Cache: license-gated, encrypted at rest, plaintext never stored', async function () {
+        var stages = [];
+        var r = await V.media.cacheProduct({ userId: user.id, productId: P1, onProgress: function (s) { if (stages.indexOf(s) < 0) stages.push(s); } });
+        assert(r.status === 'cached' && r.sizeBytes === wavP1.bytes.length, 'summary ' + JSON.stringify(r));
+        assert(stages.join(',') === 'checking,rendering,encrypting,saving,done', 'stages ' + stages.join(','));
+        var rec = await V.db.get('media_vault', P1);
+        assert(rec.iv.length === 12, 'IV length');
+        assert(rec.encrypted_audio_blob.byteLength === wavP1.bytes.length + 16, 'ciphertext size');
+        var head = new Uint8Array(rec.encrypted_audio_blob, 0, 4);
+        assert(String.fromCharCode(head[0], head[1], head[2], head[3]) !== 'RIFF', 'stored bytes look like plaintext WAV');
+        assert(rec.license_id === licP1.id, 'record not tied to license');
+        var second = await V.media.cacheProduct({ userId: user.id, productId: P1 });
+        assert(second.status === 'already_cached', 'second call: ' + second.status);
+        var a = await V.media.getAvailability({ userId: user.id, productId: P1 });
+        assert(a.state === 'ready', 'state ' + a.state);
+        return Math.round(rec.encrypted_audio_blob.byteLength / 1024) + ' KB ciphertext';
+      });
+
+      await test('Play: decrypted blob URL is byte-identical to the original audio', async function () {
+        var lease = await V.media.openForPlayback({ userId: user.id, productId: P1 });
+        var notes = [];
+        try {
+          assert(/^blob:/.test(lease.url), 'not a blob URL: ' + lease.url);
+          assert(lease.mimeType === 'audio/wav', 'mime ' + lease.mimeType);
+          try {
+            var buf = new Uint8Array(await (await fetch(lease.url)).arrayBuffer());
+            assert((await sha(buf)) === hashP1, 'decrypted audio differs from original');
+            notes.push('hash match');
+          } catch (e) {
+            if (/differs/.test(e.message)) throw e;
+            notes.push('blob fetch unavailable here');
+          }
+          if (hasDom) {
+            var d = await waitAudio(lease.url, lease.durationSec || wavP1.durationSec);
+            notes.push('<audio> decoded ' + d.toFixed(1) + 's');
+          } else {
+            notes.push('no <audio> in this environment');
+          }
+        } finally {
+          lease.revoke();
+        }
+        assert(V.media.activeLeaseCount() === 0, 'lease leaked');
+        return notes.join(', ');
+      });
+
+      await test('Redeem: sloppy formatting works, grants license, code is single-use', async function () {
+        var r = await V.ownership.redeemCode({ userId: user.id, code: ' ' + CODE[P3].toLowerCase().replace(/-/g, ' ') + ' ' });
+        assert(r.product.id === P3, 'wrong product');
+        assert(r.purchase.method === 'activation_code' && r.purchase.amount === 0 && /^ACT-/.test(r.purchase.transaction_ref), 'purchase record');
+        assert(r.license.status === 'active', 'license status');
+        var hash = await V.crypto.hashActivationCode(CODE[P3]);
+        var rec = await V.db.get('activation_codes', hash);
+        assert(rec.is_redeemed === true && rec.redeemed_by === user.id && rec.redeemed_at, 'code not marked');
+        await rejects(function () { return V.ownership.redeemCode({ userId: user.id, code: CODE[P3] }); }, 'CODE_ALREADY_REDEEMED');
+        assert((await V.db.getAllFromIndex('purchases', 'product_id', P3)).length === 1, 'reuse created a purchase');
+      });
+
+      await test('Invalid, malformed and empty codes are rejected without side effects', async function () {
+        var before = (await V.db.count('purchases'));
+        var inputs = ['ZZZZ-ZZZZ-ZZZZ', 'abc', '', '   ', null];
+        for (var i = 0; i < inputs.length; i++) {
+          await rejects(function () { return V.ownership.redeemCode({ userId: user.id, code: inputs[i] }); }, 'INVALID_CODE');
+        }
+        assert((await V.db.count('purchases')) === before, 'purchase count changed');
+      });
+
+      await test('Code for an already-owned item fails and is NOT consumed', async function () {
+        await rejects(function () { return V.ownership.redeemCode({ userId: user.id, code: CODE[P1] }); }, 'ALREADY_OWNED');
+        var rec = await V.db.get('activation_codes', await V.crypto.hashActivationCode(CODE[P1]));
+        assert(rec.is_redeemed === false, 'code was consumed');
+      });
+
+      await test('Scanner payloads: bare code and URL form are parsed', async function () {
+        var O = V.ownership;
+        assert(O.parseScannedPayload('odp://redeem?code=' + encodeURIComponent(CODE[P4])) === CODE[P4], 'url payload');
+        assert(O.parseScannedPayload(' ' + CODE[P4] + ' ') === CODE[P4], 'bare payload');
+        assert(O.parseScannedPayload('hello') === null, 'garbage accepted');
+        assert(O.parseScannedPayload('') === null && O.parseScannedPayload(null) === null, 'empty accepted');
+      });
+
+      await test('Concurrent cache requests share one job; redeemed item plays', async function () {
+        var pair = await Promise.all([
+          V.media.cacheProduct({ userId: user.id, productId: P3 }),
+          V.media.cacheProduct({ userId: user.id, productId: P3 })
+        ]);
+        assert(pair[0] === pair[1], 'jobs were not shared');
+        var lease = await V.media.openForPlayback({ userId: user.id, productId: P3 });
+        try {
+          var d = null;
+          try { d = new Uint8Array(await (await fetch(lease.url)).arrayBuffer()); } catch (_) {}
+          if (d) assert((await sha(d)) === hashP3, 'decrypted audio differs');
+        } finally { lease.revoke(); }
+      });
+
+      await test('Revoked license: file still in vault but unplayable and uncacheable', async function () {
+        await V.ownership.revokeLicense({ userId: user.id, productId: P1, reason: 'diagnostic' });
+        var v = await V.ownership.verifyLicense({ userId: user.id, productId: P1 });
+        assert(!v.licensed && v.reason === 'revoked', 'verify: ' + v.reason);
+        assert(await V.media.isCached(P1), 'vault copy should still exist');
+        await rejects(function () { return V.media.openForPlayback({ userId: user.id, productId: P1 }); }, 'NOT_LICENSED');
+        await rejects(function () { return V.media.cacheProduct({ userId: user.id, productId: P1, force: true }); }, 'NOT_LICENSED');
+        var a = await V.media.getAvailability({ userId: user.id, productId: P1 });
+        assert(a.state === 'not_owned', 'state ' + a.state);
+        var lib = await V.ownership.getLibrary({ userId: user.id });
+        assert(!lib.some(function (i) { return i.license.product_id === P1; }), 'revoked item still in library');
+      });
+
+      await test('Re-buying re-activates the same license and the cached copy works again', async function () {
+        var r = await V.ownership.purchase({ userId: user.id, productId: P1 });
+        assert(r.license.id === licP1.id && r.license.status === 'active', 'license was not re-activated');
+        assert((await V.db.getAllFromIndex('ownership_licenses', 'product_id', P1)).length === 1, 'duplicate license');
+        assert((await V.db.getAllFromIndex('purchases', 'product_id', P1)).length === 2, 'purchase history');
+        var lease = await V.media.openForPlayback({ userId: user.id, productId: P1 });
+        lease.revoke();
+      });
+
+      await test('Damaged vault ciphertext is detected and self-repairs with autoCache', async function () {
+        var rec = await V.db.get('media_vault', P3);
+        var bytes = new Uint8Array(rec.encrypted_audio_blob);
+        bytes[500] ^= 0xff;
+        await V.db.put('media_vault', rec);
+        await rejects(function () { return V.media.openForPlayback({ userId: user.id, productId: P3 }); }, 'VAULT_CORRUPT');
+        var lease = await V.media.openForPlayback({ userId: user.id, productId: P3, autoCache: true });
+        try {
+          var d = null;
+          try { d = new Uint8Array(await (await fetch(lease.url)).arrayBuffer()); } catch (_) {}
+          if (d) assert((await sha(d)) === hashP3, 'repaired audio differs');
+        } finally { lease.revoke(); }
+      });
+
+      await test('Purchase events fire once per grant', async function () {
+        var granted = 0, purchased = 0;
+        var off1 = V.ownership.on('license-granted', function () { granted++; });
+        var off2 = V.ownership.on('purchase', function () { purchased++; });
+        await V.ownership.purchase({ userId: user.id, productId: P4 });
+        off1(); off2();
+        assert(granted === 1 && purchased === 1, 'granted ' + granted + ', purchased ' + purchased);
+      });
+
+      await test('Edited license record fails the binding check', async function () {
+        var lic = await V.db.getFromIndex('ownership_licenses', 'user_product', [user.id, P4]);
+        await V.db.put('ownership_licenses', Object.assign({}, lic, { license_key: 'LIC-FAKE-FAKE-FAKE-FAKE' }));
+        var v = await V.ownership.verifyLicense({ userId: user.id, productId: P4 });
+        assert(!v.licensed && v.reason === 'binding_mismatch', 'verify: ' + v.reason);
+        await V.db.put('ownership_licenses', lic);
+        v = await V.ownership.verifyLicense({ userId: user.id, productId: P4 });
+        assert(v.licensed, 'restored license should verify: ' + v.reason);
+      });
+
+      await test('A vault entry relabelled to another product is refused', async function () {
+        await V.ownership.purchase({ userId: user.id, productId: P5 });
+        var stolen = await V.db.get('media_vault', P3);
+        await V.db.put('media_vault', Object.assign({}, stolen, { product_id: P5 }));
+        await rejects(function () { return V.media.openForPlayback({ userId: user.id, productId: P5 }); }, 'NOT_CACHED');
+        await V.media.evict(P5);
+        assert(!(await V.media.isCached(P5)), 'evict failed');
+      });
+
+      await test('Library and purchase history are consistent', async function () {
+        var lib = await V.ownership.getLibrary({ userId: user.id });
+        var ids = lib.map(function (i) { return i.license.product_id; }).sort();
+        assert(ids.join(',') === [P1, P2, P3, P4, P5].sort().join(','), 'library: ' + ids.join(','));
+        assert(lib.every(function (i) { return i.product && i.purchase; }), 'missing joins');
+        var hist = await V.ownership.getPurchaseHistory({ userId: user.id });
+        assert(hist.length === 6, 'history rows: ' + hist.length);
+        var refs = {};
+        hist.forEach(function (h) { refs[h.transaction_ref] = 1; });
+        assert(Object.keys(refs).length === 6, 'transaction refs not unique');
+        var cached = (await V.media.listCachedIds()).sort();
+        assert(cached.join(',') === [P1, P3].sort().join(','), 'cached ids: ' + cached.join(','));
+      });
+
+      await test('Evict removes only the encrypted copy; ownership survives', async function () {
+        await V.media.evict(P3);
+        var a = await V.media.getAvailability({ userId: user.id, productId: P3 });
+        assert(a.state === 'owned_not_cached', 'state ' + a.state);
+        assert((await V.ownership.verifyLicense({ userId: user.id, productId: P3 })).licensed, 'license lost');
+        await V.media.cacheProduct({ userId: user.id, productId: P3 });
+        assert(await V.media.isCached(P3), 're-cache failed');
+      });
+
+      var failed = results.filter(function (r) { return r.status === 'fail'; }).length;
+      return { ok: failed === 0, total: results.length, failed: failed, results: results };
+    }
+  </script>
+
+  <!-- ================================ UI ================================ -->
+  <script id="ui">
+    (function () {
+      if (typeof document === 'undefined') return;
+      var $ = function (id) { return document.getElementById(id); };
+      var V = Vault;
+      var ctx = { user: null, lease: null };
+
+      function log(msg) {
+        var el = $('log');
+        el.textContent = new Date().toLocaleTimeString() + '  ' + msg + '\n' + el.textContent;
+      }
+      function esc(s) {
+        return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; });
+      }
+      function fmtErr(e) { return (e && e.code ? e.code + ': ' : '') + ((e && e.message) || e); }
+      function selected() { return $('product').value; }
+
+      async function refresh() {
+        if (!ctx.user) return;
+        var catalog = await V.ownership.getCatalog();
+        var owned = await V.ownership.getOwnedProductIds({ userId: ctx.user.id });
+        var cachedIds = await V.media.listCachedIds();
+        var current = selected();
+        $('product').innerHTML = catalog.map(function (p) {
+          var tags = (owned.indexOf(p.id) >= 0 ? ' [owned]' : '') + (cachedIds.indexOf(p.id) >= 0 ? ' [cached]' : '');
+          return '<option value="' + esc(p.id) + '">' + esc(p.title) + ' - ' + esc(p.artist) + ' ($' + (p.price / 100).toFixed(2) + ')' + tags + '</option>';
+        }).join('');
+        if (current) $('product').value = current;
+        var a = await V.media.getAvailability({ userId: ctx.user.id, productId: selected() });
+        $('state').textContent = 'State: ' + a.state + (a.reason !== 'ok' && a.reason !== 'no_license' ? ' (' + a.reason + ')' : '');
+      }
+
+      async function act(label, fn) {
+        try {
+          var out = await fn();
+          log(label + ' OK' + (out ? ': ' + out : ''));
+        } catch (e) {
+          log(label + ' FAILED  ' + fmtErr(e));
+        }
+        await refresh();
+      }
+
+      async function boot() {
+        try {
+          await V.db.init();
+          ctx.user = await V.db.getCurrentUser();
+          $('who').textContent = 'Local user: ' + ctx.user.username + ' (' + ctx.user.id + ')';
+          $('codeButtons').innerHTML = V.db.TEST_ACTIVATION_CODES.map(function (c) {
+            return '<button data-code="' + esc(c.code) + '">' + esc(c.code) + '</button>';
+          }).join('');
+          await refresh();
+        } catch (e) {
+          log('BOOT FAILED  ' + fmtErr(e));
+        }
+      }
+
+      $('product').onchange = refresh;
+      $('buy').onclick = function () {
+        act('Buy', async function () {
+          var r = await V.ownership.purchase({ userId: ctx.user.id, productId: selected(), simulateDelayMs: 400 });
+          return r.purchase.transaction_ref;
+        });
+      };
+      $('cache').onclick = function () {
+        act('Cache', async function () {
+          var last = '';
+          var r = await V.media.cacheProduct({ userId: ctx.user.id, productId: selected(), onProgress: function (s, f) {
+            var line = s + ' ' + Math.round(f * 100) + '%';
+            if (line !== last) { last = line; $('state').textContent = 'Caching: ' + line; }
+          } });
+          return r.status + (r.sizeBytes ? ' (' + Math.round(r.sizeBytes / 1024) + ' KB)' : '');
+        });
+      };
+      $('play').onclick = function () {
+        act('Play', async function () {
+          if (ctx.lease) { $('player').pause(); ctx.lease.revoke(); ctx.lease = null; }
+          ctx.lease = await V.media.openForPlayback({ userId: ctx.user.id, productId: selected() });
+          $('player').src = ctx.lease.url;
+          await $('player').play();
+          return 'playing ' + ctx.lease.product.title;
+        });
+      };
+      $('revoke').onclick = function () {
+        act('Revoke', async function () {
+          await V.ownership.revokeLicense({ userId: ctx.user.id, productId: selected(), reason: 'playground' });
+          return 'license revoked (vault copy kept). Buy again to re-activate.';
+        });
+      };
+      $('evict').onclick = function () {
+        act('Evict', async function () { await V.media.evict(selected()); return 'encrypted copy removed'; });
+      };
+      $('redeem').onclick = function () {
+        act('Redeem', async function () {
+          var r = await V.ownership.redeemCode({ userId: ctx.user.id, code: $('code').value });
+          $('product').value = r.product.id;
+          return 'unlocked "' + r.product.title + '"';
+        });
+      };
+      $('codeButtons').onclick = function (e) {
+        var code = e.target && e.target.getAttribute('data-code');
+        if (code) $('code').value = code;
+      };
+
+      $('runSuite').onclick = async function () {
+        var btn = $('runSuite');
+        btn.disabled = true;
+        $('results').innerHTML = '';
+        $('summary').textContent = 'Running...';
+        try {
+          if (ctx.lease) { ctx.lease.revoke(); ctx.lease = null; }
+          var outcome = await runPhase2Suite(function (row) {
+            var div = document.createElement('div');
+            div.className = 'row';
+            div.innerHTML = '<span class="' + row.status + '">' + row.status.toUpperCase() + '</span> ' + esc(row.test) +
+              ' <span class="note">(' + row.ms + ' ms)</span>' +
+              (row.note ? '<div class="note">' + esc(row.note) + '</div>' : '');
+            $('results').appendChild(div);
+          });
+          $('summary').innerHTML = outcome.ok
+            ? '<span class="pass">ALL ' + outcome.total + ' CHECKS PASSED</span>'
+            : '<span class="fail">' + outcome.failed + ' OF ' + outcome.total + ' FAILED</span>';
+          ctx.user = await V.db.getCurrentUser();
+          await refresh();
+        } catch (e) {
+          $('summary').innerHTML = '<span class="fail">Suite crashed: ' + esc(fmtErr(e)) + '</span>';
+        }
+        btn.disabled = false;
+      };
+
+      boot();
+    })();
+  </script>
+</body>
+</html>

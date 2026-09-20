@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0a0a">
+  <meta name="color-scheme" content="dark">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>OWN - Music you keep</title>
+
+  <!-- Tailwind via CDN (needs network on first load; all app logic and data are local/offline) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    html, body { height: 100%; margin: 0; overscroll-behavior: none; }
+    body { background: #0a0a0a; color: #f4f4f5; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; }
+    button, input, select { font: inherit; touch-action: manipulation; }
+    button { cursor: pointer; }
+    button:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid #a78bfa; outline-offset: 2px; }
+    .hidden { display: none !important; }
+
+    /* App frame (plain CSS so layout survives even if the Tailwind CDN is unreachable) */
+    #app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; padding-top: env(safe-area-inset-top, 0px); }
+    #view { flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+    #nav { padding-bottom: env(safe-area-inset-bottom, 0px); }
+
+    /* Buttons */
+    .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 9999px; border: 0; background: transparent; color: #d4d4d8; }
+    .icon-btn:active { background: rgba(255,255,255,.1); }
+    .icon-btn.on { color: #a78bfa; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; min-height: 40px; padding: .5rem 1rem; border-radius: 9999px; border: 0; background: transparent; color: inherit; font-size: .875rem; font-weight: 600; }
+    .btn:disabled { opacity: .5; }
+    .btn-primary { background: #7c3aed; color: #fff; }
+    .btn-primary:active { background: #6d28d9; }
+    .btn-ghost { background: rgba(255,255,255,.09); color: #f4f4f5; }
+    .btn-ghost:active { background: rgba(255,255,255,.16); }
+    .btn-light { background: #f4f4f5; color: #0a0a0a; }
+    .chip { display: inline-block; border-radius: 9999px; padding: .1rem .55rem; font-size: .68rem; font-weight: 600; }
+
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Seek / volume sliders */
+    input[type=range].seek { -webkit-appearance: none; appearance: none; width: 100%; height: 28px; background: transparent; margin: 0; }
+    input[type=range].seek::-webkit-slider-runnable-track { height: 4px; border-radius: 9999px; background: linear-gradient(to right, #a78bfa var(--p, 0%), #3f3f46 var(--p, 0%)); }
+    input[type=range].seek::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; margin-top: -6px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.5); }
+    input[type=range].seek::-moz-range-track { height: 4px; border-radius: 9999px; background: #3f3f46; }
+    input[type=range].seek::-moz-range-progress { height: 4px; border-radius: 9999px; background: #a78bfa; }
+    input[type=range].seek::-moz-range-thumb { width: 16px; height: 16px; border: 0; border-radius: 50%; background: #fff; }
+
+    /* QR scanner frame */
+    .scan-frame { position: absolute; inset: 14%; pointer-events: none; }
+    .scan-frame i { position: absolute; width: 28px; height: 28px; border: 3px solid #a78bfa; }
+    .scan-frame i:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; border-top-left-radius: 10px; }
+    .scan-frame i:nth-child(2) { top: 0; right: 0; border-left: 0; border-bottom: 0; border-top-right-radius: 10px; }
+    .scan-frame i:nth-child(3) { bottom: 0; left: 0; border-right: 0; border-top: 0; border-bottom-left-radius: 10px; }
+    .scan-frame i:nth-child(4) { bottom: 0; right: 0; border-left: 0; border-top: 0; border-bottom-right-radius: 10px; }
+
+    details > summary { list-style: none; cursor: pointer; }
+    details > summary::-webkit-details-marker { display: none; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="banner"></div>
+    <main id="view" tabindex="-1"></main>
+    <div id="mini"></div>
+    <nav id="nav" class="border-t border-white/10 bg-neutral-950" aria-label="Main"></nav>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-root" role="status" aria-live="polite"
+       class="pointer-events-none fixed inset-x-3 z-[60] flex flex-col items-center gap-2"
+       style="position: fixed; left: 12px; right: 12px; z-index: 60; top: calc(env(safe-area-inset-top, 0px) + 12px)"></div>
+
+  <!-- Order matters: crypto -> db -> ownership -> media -> app -->
+  <script src="src/crypto.js"></script>
+  <script src="src/db.js"></script>
+  <script src="src/services/ownership.js"></script>
+  <script src="src/services/media.js"></script>
+  <script src="src/app.js"></script>
+</body>
+</html>
